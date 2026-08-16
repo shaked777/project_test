@@ -11,6 +11,7 @@ optional `on_progress` callback so the caller decides how to display it.
 """
 
 import base64
+import json
 from io import BytesIO
 
 import requests
@@ -188,15 +189,27 @@ def build_prompt(mode, grading_rubric):
     """
 
 
-def grade_images_local(base64_images, grading_rubric, mode, timeout=300, on_progress=None):
+def grade_images_local(
+    base64_images, grading_rubric, mode, timeout=900, on_progress=None, on_token=None
+):
     """
     Sends the base64 images and the specific grading rubric to the local model.
     The prompt framing and strictness follow the selected mode ('exam' or 'homework').
+
+    The response is streamed. Each chunk of generated text is handed to `on_token`
+    as it arrives, so a caller can show the report being written instead of
+    sitting on a frozen screen while the model thinks. The full report is
+    returned once the stream ends.
+
+    `timeout` applies to each network read, not to the run as a whole, so a slow
+    but healthy model is never cut off mid-report.
     """
     on_progress = on_progress or _noop
+    on_token = on_token or _noop
     mode_config = GRADING_MODES[mode]
     on_progress(
-        f"Connecting to local {MODEL_NAME} model to evaluate the {mode_config['label'].lower()}..."
+        f"Sending {len(base64_images)} page(s) to the local {MODEL_NAME} model to evaluate the "
+        f"{mode_config['label'].lower()}. The first words can take a minute or two to appear..."
     )
 
     payload = {
@@ -208,28 +221,52 @@ def grade_images_local(base64_images, grading_rubric, mode, timeout=300, on_prog
                 "images": base64_images,
             }
         ],
-        "stream": False,
+        "stream": True,
         # Deterministic decoding: the same submission should always earn the same grade.
         "options": {"temperature": 0},
     }
 
+    chunks = []
     try:
-        response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout)
-        response.raise_for_status()
+        with requests.post(
+            OLLAMA_CHAT_URL, json=payload, timeout=timeout, stream=True
+        ) as response:
+            response.raise_for_status()
+
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue  # ignore keep-alive or partial frames
+
+                if event.get("error"):
+                    raise GradingError(f"The model reported an error: {event['error']}")
+
+                piece = event.get("message", {}).get("content", "")
+                if piece:
+                    chunks.append(piece)
+                    on_token(piece)
+
+                if event.get("done"):
+                    break
     except requests.exceptions.Timeout:
         raise GradingError(
-            "The local model took too long to respond. Consider reducing the DPI setting."
+            "The local model stopped responding. Try a lower DPI setting, or check that "
+            "the Ollama application is still running."
         )
     except requests.exceptions.RequestException as e:
         raise GradingError(f"Network communication failed with the local API endpoint. Details: {e}")
 
-    result = response.json().get("message", {}).get("content")
+    result = "".join(chunks).strip()
     if not result:
         raise GradingError("No text response payload was received from the model.")
-    return result.strip()
+    return result
 
 
-def grade_pdf(pdf_path, mode, dpi=72, on_progress=None):
+def grade_pdf(pdf_path, mode, dpi=72, on_progress=None, on_token=None):
     """
     Runs the full pipeline for one submission and returns the model's report.
     This is the single entry point used by both the desktop app and the CLI.
@@ -248,5 +285,9 @@ def grade_pdf(pdf_path, mode, dpi=72, on_progress=None):
     pages = extract_images_from_pdf(pdf_path, dpi=dpi, on_progress=on_progress)
     encoded_pages = convert_pil_images_to_base64(pages, on_progress=on_progress)
     return grade_images_local(
-        encoded_pages, GRADING_MODES[mode]["rubric"], mode, on_progress=on_progress
+        encoded_pages,
+        GRADING_MODES[mode]["rubric"],
+        mode,
+        on_progress=on_progress,
+        on_token=on_token,
     )

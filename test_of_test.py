@@ -50,16 +50,23 @@ def main(argv):
     print(f"\nStarting the automated LOCAL grading process ({mode_config['label']})...")
     print(f"[Info] Target document: {pdf_file_path}\n")
 
-    result = grade_pdf(
+    header_shown = []
+
+    def show_token(piece):
+        if not header_shown:
+            header_shown.append(True)
+            print(f"\n--- Local Grading Result ({mode_config['label']}) ---\n")
+        print(piece, end="", flush=True)
+
+    grade_pdf(
         pdf_file_path,
         mode,
         dpi=72,
-        on_progress=lambda message: print(f"[Info] {message}"),
+        on_progress=lambda message: print(f"[Info] {message}", flush=True),
+        on_token=show_token,
     )
 
-    print(f"\n--- Local Grading Result ({mode_config['label']}) ---\n")
-    print(result)
-    print("\n----------------------------\n")
+    print("\n\n----------------------------\n")
 
 
 if __name__ == "__main__":

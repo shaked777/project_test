@@ -13,6 +13,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
@@ -39,6 +40,10 @@ class GraderApp(ttk.Frame):
         # Messages published by the worker thread, drained on the UI thread.
         self._events = queue.Queue()
         self._worker = None
+        self._started_at = None
+        self._streaming = False
+        self._last_status = "Ready."
+        self._report = ""
 
         self.mode_var = tk.StringVar(value="exam")
         self.pdf_var = tk.StringVar(value=self._default_pdf("exam"))
@@ -200,6 +205,7 @@ class GraderApp(ttk.Frame):
             f"Grading {GRADING_MODES[mode]['label'].lower()}: {os.path.basename(pdf_path)}\n\n",
             "heading",
         )
+        self._streaming = False
         self._set_busy(True)
 
         self._worker = threading.Thread(
@@ -215,6 +221,7 @@ class GraderApp(ttk.Frame):
                 mode,
                 dpi=dpi,
                 on_progress=lambda message: self._events.put(("progress", message)),
+                on_token=lambda piece: self._events.put(("token", piece)),
             )
             self._events.put(("result", report))
         except GradingError as e:
@@ -231,15 +238,23 @@ class GraderApp(ttk.Frame):
                 kind, payload = self._events.get_nowait()
 
                 if kind == "progress":
-                    self.status_var.set(payload)
+                    self._set_status(payload)
                     self._append(f"{payload}\n", "info")
+                elif kind == "token":
+                    if not self._streaming:
+                        # First words back from the model: open the report section.
+                        self._streaming = True
+                        self._append(f"\n{'-' * 60}\n\n")
+                        self._set_status("Writing the report...")
+                    self._append(payload)
                 elif kind == "result":
-                    self._append(f"\n{'-' * 60}\n\n")
-                    self._append(payload.strip() + "\n")
-                    self.status_var.set("Grading complete.")
+                    # The text already streamed in; keep the clean copy for saving.
+                    self._report = payload
+                    self._append("\n")
+                    self._set_status("Grading complete.")
                 elif kind == "error":
                     self._append(f"\n{payload}\n", "error")
-                    self.status_var.set("Grading failed.")
+                    self._set_status("Grading failed.")
                     messagebox.showerror(APP_TITLE, payload)
                 elif kind == "done":
                     self._set_busy(False)
@@ -250,11 +265,32 @@ class GraderApp(ttk.Frame):
 
     def _set_busy(self, busy):
         if busy:
+            self._started_at = time.time()
             self.grade_button.state(["disabled"])
             self.progress.start(12)
+            self._tick_clock()
         else:
+            self._started_at = None
             self.grade_button.state(["!disabled"])
             self.progress.stop()
+
+    def _set_status(self, message):
+        """Records the current step; the clock re-renders it with elapsed time."""
+        self._last_status = message
+        self.status_var.set(self._decorate_status(message))
+
+    def _decorate_status(self, message):
+        if self._started_at is None:
+            return message
+        elapsed = int(time.time() - self._started_at)
+        return f"{message}   [{elapsed // 60}:{elapsed % 60:02d} elapsed]"
+
+    def _tick_clock(self):
+        """Keeps a visible timer running so a slow model never looks frozen."""
+        if self._started_at is None:
+            return
+        self.status_var.set(self._decorate_status(self._last_status))
+        self.after(1000, self._tick_clock)
 
     def _append(self, text, tag=None):
         self.output.configure(state="normal")
@@ -266,7 +302,8 @@ class GraderApp(ttk.Frame):
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         self.output.configure(state="disabled")
-        self.status_var.set("Ready.")
+        self._report = ""
+        self._set_status("Ready.")
 
     def save_report(self):
         report = self.output.get("1.0", "end").strip()
